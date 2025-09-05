@@ -6,16 +6,33 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import joblib
 from numba import jit, prange
 import time
+import os
 
-# 检测GPU可用性
+# 设置CPU优化环境变量
+os.environ['OPENBLAS_NUM_THREADS'] = str(cpu_count())
+os.environ['MKL_NUM_THREADS'] = str(cpu_count())
+os.environ['NUMEXPR_NUM_THREADS'] = str(cpu_count())
+
+# 更安全的GPU检测
+GPU_AVAILABLE = False
 try:
     import cupy as cp
-    GPU_AVAILABLE = True
-    print(f"检测到GPU: {cp.cuda.runtime.getDeviceCount()}张")
-except ImportError:
+    # 检查是否真的有可用的GPU设备
+    device_count = cp.cuda.runtime.getDeviceCount()
+    if device_count > 0:
+        # 测试GPU基本功能
+        test_array = cp.array([1, 2, 3])
+        cp.asnumpy(test_array)
+        GPU_AVAILABLE = True
+        print(f"检测到GPU: {device_count}张")
+    else:
+        GPU_AVAILABLE = False
+        print("CUDA运行时可用但未检测到GPU设备")
+except Exception as e:
     import numpy as cp
     GPU_AVAILABLE = False
-    print("GPU不可用，使用CPU计算")
+    print(f"GPU不可用: {str(e)[:100]}...")
+    print("使用CPU多核并行计算")
 
 # -------------------------- 1. 常量与初始参数定义 --------------------------
 g = 9.80665  # 重力加速度 (m/s²)
@@ -54,13 +71,13 @@ missile_m1 = {
 dt = 0.001  # 时间步长
 
 # -------------------------- 2. Numba加速核心计算函数 --------------------------
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def calc_uav_direction_numba(angle_deg):
     """Numba加速的无人机飞行方向计算"""
     angle_rad = np.radians(angle_deg)
     return np.array([np.cos(angle_rad), np.sin(angle_rad)])
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def calc_drop_point_numba(uav_init_pos, uav_speed, drop_delay, angle_deg):
     """Numba加速的投放点计算"""
     dir_vec_xy = calc_uav_direction_numba(angle_deg)
@@ -68,7 +85,7 @@ def calc_drop_point_numba(uav_init_pos, uav_speed, drop_delay, angle_deg):
     drop_xy = uav_init_pos[:2] + dir_vec_xy * flight_dist
     return np.array([drop_xy[0], drop_xy[1], uav_init_pos[2]])
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def calc_det_point_numba(drop_point, uav_speed, det_delay, angle_deg):
     """Numba加速的起爆点计算"""
     dir_vec_xy = calc_uav_direction_numba(angle_deg)
@@ -78,7 +95,7 @@ def calc_det_point_numba(drop_point, uav_speed, det_delay, angle_deg):
     det_z = drop_point[2] - drop_h
     return np.array([det_xy[0], det_xy[1], det_z])
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def is_segment_intersect_sphere_numba(M, P, C, r):
     """Numba加速的线段-球相交检测"""
     MP = P - M
@@ -104,7 +121,7 @@ def is_segment_intersect_sphere_numba(M, P, C, r):
     
     return (s1 <= 1.0 + epsilon) and (s2 >= -epsilon)
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def check_all_samples_shielded_numba(missile_pos, smoke_center, smoke_r, target_samples):
     """Numba加速的批量遮蔽检测"""
     for i in range(len(target_samples)):
@@ -112,13 +129,52 @@ def check_all_samples_shielded_numba(missile_pos, smoke_center, smoke_r, target_
             return False
     return True
 
-@jit(nopython=True)
+@jit(nopython=True, cache=True)
 def check_any_smoke_shields_numba(missile_pos, smoke_centers, smoke_r, target_samples):
     """检查是否有任一烟幕完全遮蔽目标"""
     for i in range(len(smoke_centers)):
         if check_all_samples_shielded_numba(missile_pos, smoke_centers[i], smoke_r, target_samples):
             return True
     return False
+
+@jit(nopython=True, cache=True, parallel=True)
+def calc_time_chunk_numba(time_chunk, missile_init_pos, missile_dir, missile_speed, 
+                          uav_det_points, uav_det_times, smoke_r, sink_speed, 
+                          valid_time, target_samples, dt_val):
+    """Numba并行加速的时间块计算"""
+    valid_time_total = 0.0
+    
+    for t_idx in prange(len(time_chunk)):
+        t = time_chunk[t_idx]
+        
+        # 计算导弹位置
+        missile_pos = missile_init_pos + missile_dir * missile_speed * t
+        
+        # 计算有效烟幕数量
+        active_smoke_count = 0
+        active_smoke_centers = np.zeros((len(uav_det_points), 3))
+        
+        for uav_idx in range(len(uav_det_points)):
+            det_time = uav_det_times[uav_idx]
+            det_point = uav_det_points[uav_idx]
+            
+            if t >= det_time and t <= det_time + valid_time:
+                sink_time = t - det_time
+                smoke_center = np.array([
+                    det_point[0],
+                    det_point[1],
+                    det_point[2] - sink_speed * sink_time
+                ])
+                active_smoke_centers[active_smoke_count] = smoke_center
+                active_smoke_count += 1
+        
+        # 检查遮蔽
+        if active_smoke_count > 0:
+            active_centers = active_smoke_centers[:active_smoke_count]
+            if check_any_smoke_shields_numba(missile_pos, active_centers, smoke_r, target_samples):
+                valid_time_total += dt_val
+    
+    return valid_time_total
 
 # -------------------------- 3. 核心计算函数 --------------------------
 def calc_uav_direction(uav_init_pos, fake_target, angle_deg):
@@ -172,104 +228,20 @@ def generate_high_density_samples(target, num_circle=60, num_height=20):
     
     return np.unique(np.array(samples), axis=0)
 
-# -------------------------- 4. GPU加速版本 --------------------------
-def calc_shield_time_gpu_accelerated(params, uav_names, target_samples):
-    """GPU加速版本的遮蔽时间计算"""
-    if not GPU_AVAILABLE or len(target_samples) < 1000:
-        return calc_total_shield_time_parallel(params, uav_names, target_samples)
-    
-    try:
-        # 将数据移到GPU
-        target_samples_gpu = cp.asarray(target_samples)
-        
-        num_uavs = len(uav_names)
-        
-        # 解析参数
-        uav_params = {}
-        for i, uav_name in enumerate(uav_names):
-            idx = i * 4
-            uav_params[uav_name] = {
-                "speed": params[idx],
-                "drop_delay": params[idx + 1],
-                "det_delay": params[idx + 2],
-                "angle": params[idx + 3]
-            }
-        
-        # 计算每架无人机的起爆点和起爆时间
-        uav_data = {}
-        for uav_name in uav_names:
-            uav_pos = uav_positions[uav_name]
-            param = uav_params[uav_name]
-            
-            drop_point = calc_drop_point_numba(uav_pos, param["speed"], param["drop_delay"], param["angle"])
-            det_point = calc_det_point_numba(drop_point, param["speed"], param["det_delay"], param["angle"])
-            det_time = param["drop_delay"] + param["det_delay"]
-            
-            uav_data[uav_name] = {
-                "det_point": det_point,
-                "det_time": det_time,
-                "param": param
-            }
-        
-        # 计算导弹飞行方向
-        missile_vec = fake_target - missile_m1["init_pos"]
-        missile_dist = np.linalg.norm(missile_vec)
-        if missile_dist < epsilon:
-            missile_dir = np.array([0.0, 0.0, 0.0])
-        else:
-            missile_dir = missile_vec / missile_dist
-        
-        # 确定时间范围
-        min_det_time = min(data["det_time"] for data in uav_data.values())
-        max_det_time = max(data["det_time"] for data in uav_data.values())
-        
-        t_start = min_det_time
-        t_end = max_det_time + smoke_param["valid_time"]
-        t_list = cp.arange(t_start, t_end + dt, dt)
-        
-        # GPU批量计算
-        valid_count = 0
-        missile_init_pos_gpu = cp.asarray(missile_m1["init_pos"])
-        missile_dir_gpu = cp.asarray(missile_dir)
-        missile_speed = missile_m1["speed"]
-        
-        # 批量计算导弹轨迹
-        missile_positions = missile_init_pos_gpu + missile_dir_gpu * missile_speed * t_list[:, cp.newaxis]
-        
-        for i, t in enumerate(cp.asnumpy(t_list)):
-            missile_pos = cp.asnumpy(missile_positions[i])
-            
-            # 计算当前时刻的有效烟幕
-            active_smoke_centers = []
-            for uav_name, data in uav_data.items():
-                det_time = data["det_time"]
-                det_point = data["det_point"]
-                
-                if t >= det_time and t <= det_time + smoke_param["valid_time"]:
-                    sink_time = t - det_time
-                    smoke_center = np.array([
-                        det_point[0],
-                        det_point[1],
-                        det_point[2] - smoke_param["sink_speed"] * sink_time
-                    ])
-                    active_smoke_centers.append(smoke_center)
-            
-            if active_smoke_centers:
-                active_smoke_centers = np.array(active_smoke_centers)
-                if check_any_smoke_shields_numba(missile_pos, active_smoke_centers, smoke_param["r"], target_samples):
-                    valid_count += 1
-        
-        return valid_count * dt
-        
-    except Exception as e:
-        print(f"GPU计算错误，回退到CPU: {e}")
-        return calc_total_shield_time_parallel(params, uav_names, target_samples)
-
-# -------------------------- 5. CPU多核并行版本 --------------------------
+# -------------------------- 4. 高性能CPU并行版本 --------------------------
 def calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=None):
-    """CPU多核并行版本的遮蔽时间计算"""
+    """高性能CPU多核并行版本"""
     if n_jobs is None:
-        n_jobs = min(cpu_count(), 56)  # 使用一半核心，保留其他任务使用
+        total_cores = cpu_count()
+        # 根据核心数智能分配
+        if total_cores >= 100:
+            n_jobs = min(80, int(total_cores * 0.8))  # 大型服务器
+        elif total_cores >= 50:
+            n_jobs = min(40, int(total_cores * 0.75))
+        elif total_cores >= 16:
+            n_jobs = min(12, total_cores - 2)
+        else:
+            n_jobs = max(1, total_cores // 2)
     
     try:
         num_uavs = len(uav_names)
@@ -285,8 +257,10 @@ def calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=No
                 "angle": params[idx + 3]
             }
         
-        # 计算每架无人机的起爆点和起爆时间
-        uav_data = {}
+        # 预计算所有无人机数据
+        uav_det_points = []
+        uav_det_times = []
+        
         for uav_name in uav_names:
             uav_pos = uav_positions[uav_name]
             param = uav_params[uav_name]
@@ -295,11 +269,12 @@ def calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=No
             det_point = calc_det_point_numba(drop_point, param["speed"], param["det_delay"], param["angle"])
             det_time = param["drop_delay"] + param["det_delay"]
             
-            uav_data[uav_name] = {
-                "det_point": det_point,
-                "det_time": det_time,
-                "param": param
-            }
+            uav_det_points.append(det_point)
+            uav_det_times.append(det_time)
+        
+        # 转换为numpy数组
+        uav_det_points = np.array(uav_det_points)
+        uav_det_times = np.array(uav_det_times)
         
         # 计算导弹飞行方向
         missile_vec = fake_target - missile_m1["init_pos"]
@@ -310,53 +285,36 @@ def calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=No
             missile_dir = missile_vec / missile_dist
         
         # 确定时间范围
-        min_det_time = min(data["det_time"] for data in uav_data.values())
-        max_det_time = max(data["det_time"] for data in uav_data.values())
+        min_det_time = np.min(uav_det_times)
+        max_det_time = np.max(uav_det_times)
         
         t_start = min_det_time
         t_end = max_det_time + smoke_param["valid_time"]
         t_list = np.arange(t_start, t_end + dt, dt)
         
-        # 并行计算时间块
-        def calc_time_chunk(time_chunk):
-            """计算时间片段的遮蔽状态"""
-            valid_time = 0.0
-            
-            for t in time_chunk:
-                # 计算导弹位置
-                missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
-                
-                # 计算所有有效烟幕的位置
-                active_smoke_centers = []
-                for uav_name, data in uav_data.items():
-                    det_time = data["det_time"]
-                    det_point = data["det_point"]
-                    
-                    # 检查烟幕是否已起爆且仍有效
-                    if t >= det_time and t <= det_time + smoke_param["valid_time"]:
-                        sink_time = t - det_time
-                        smoke_center = np.array([
-                            det_point[0],
-                            det_point[1],
-                            det_point[2] - smoke_param["sink_speed"] * sink_time
-                        ])
-                        active_smoke_centers.append(smoke_center)
-                
-                # 判断是否被遮蔽
-                if active_smoke_centers:
-                    active_smoke_centers = np.array(active_smoke_centers)
-                    if check_any_smoke_shields_numba(missile_pos, active_smoke_centers, smoke_param["r"], target_samples):
-                        valid_time += dt
-            
-            return valid_time
-        
-        # 将时间序列分割为多个块进行并行计算
-        chunk_size = max(100, len(t_list) // (n_jobs * 4))  # 确保每个块有足够的工作量
+        # 优化的并行计算
+        chunk_size = max(500, len(t_list) // (n_jobs * 2))  # 增大块大小减少开销
         time_chunks = [t_list[i:i + chunk_size] for i in range(0, len(t_list), chunk_size)]
         
-        # 使用joblib并行计算
-        results = joblib.Parallel(n_jobs=n_jobs, backend='threading', prefer="threads")(
-            joblib.delayed(calc_time_chunk)(chunk) for chunk in time_chunks
+        # 使用Numba并行函数
+        def calc_chunk_wrapper(time_chunk):
+            return calc_time_chunk_numba(
+                time_chunk, 
+                missile_m1["init_pos"], 
+                missile_dir, 
+                missile_m1["speed"],
+                uav_det_points, 
+                uav_det_times, 
+                smoke_param["r"], 
+                smoke_param["sink_speed"],
+                smoke_param["valid_time"], 
+                target_samples, 
+                dt
+            )
+        
+        # 并行计算
+        results = joblib.Parallel(n_jobs=n_jobs, backend='threading')(
+            joblib.delayed(calc_chunk_wrapper)(chunk) for chunk in time_chunks
         )
         
         return sum(results)
@@ -365,142 +323,48 @@ def calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=No
         print(f"并行计算错误: {e}")
         return 0.0
 
-# -------------------------- 6. 标准版本 (兜底) --------------------------
+# -------------------------- 5. 标准版本 (兜底) --------------------------
 def calc_total_shield_time_multi_uav(params, uav_names, target_samples):
     """标准版本的遮蔽时间计算"""
-    try:
-        num_uavs = len(uav_names)
-        
-        # 解析参数
-        uav_params = {}
-        for i, uav_name in enumerate(uav_names):
-            idx = i * 4
-            uav_params[uav_name] = {
-                "speed": params[idx],
-                "drop_delay": params[idx + 1],
-                "det_delay": params[idx + 2],
-                "angle": params[idx + 3]
-            }
-        
-        # 计算每架无人机的起爆点和起爆时间
-        uav_data = {}
-        for uav_name in uav_names:
-            uav_pos = uav_positions[uav_name]
-            param = uav_params[uav_name]
-            
-            drop_point = calc_drop_point(
-                uav_pos, param["speed"], param["drop_delay"], 
-                fake_target, param["angle"]
-            )
-            
-            det_point = calc_det_point(
-                drop_point, param["speed"], param["det_delay"], g,
-                fake_target, param["angle"], uav_pos
-            )
-            
-            det_time = param["drop_delay"] + param["det_delay"]
-            
-            uav_data[uav_name] = {
-                "det_point": det_point,
-                "det_time": det_time,
-                "param": param
-            }
-        
-        # 计算导弹飞行方向
-        missile_vec = fake_target - missile_m1["init_pos"]
-        missile_dist = np.linalg.norm(missile_vec)
-        if missile_dist < epsilon:
-            missile_dir = np.array([0.0, 0.0, 0.0])
-        else:
-            missile_dir = missile_vec / missile_dist
-        
-        # 确定时间范围
-        min_det_time = min(data["det_time"] for data in uav_data.values())
-        max_det_time = max(data["det_time"] for data in uav_data.values())
-        
-        t_start = min_det_time
-        t_end = max_det_time + smoke_param["valid_time"]
-        t_list = np.arange(t_start, t_end + dt, dt)
-        
-        # 逐时刻计算遮蔽状态
-        valid_total = 0.0
-        
-        for t in t_list:
-            # 计算导弹位置
-            missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
-            
-            # 计算所有有效烟幕的位置
-            active_smoke_centers = []
-            for uav_name, data in uav_data.items():
-                det_time = data["det_time"]
-                det_point = data["det_point"]
-                
-                # 检查烟幕是否已起爆且仍有效
-                if t >= det_time and t <= det_time + smoke_param["valid_time"]:
-                    sink_time = t - det_time
-                    smoke_center = np.array([
-                        det_point[0],
-                        det_point[1],
-                        det_point[2] - smoke_param["sink_speed"] * sink_time
-                    ])
-                    active_smoke_centers.append(smoke_center)
-            
-            # 判断是否被遮蔽
-            if active_smoke_centers:
-                for smoke_center in active_smoke_centers:
-                    if check_all_samples_shielded_numba(missile_pos, smoke_center, smoke_param["r"], target_samples):
-                        valid_total += dt
-                        break
-        
-        return valid_total
-        
-    except Exception as e:
-        print(f"计算错误: {e}")
-        return 0.0
+    return calc_total_shield_time_parallel(params, uav_names, target_samples, n_jobs=1)
 
-# -------------------------- 7. 智能优化策略 --------------------------
+# -------------------------- 6. 智能优化策略 --------------------------
 def ultimate_optimization_strategy(uav_names, target_samples):
-    """终极优化策略：自动选择最佳计算方式"""
+    """CPU优化策略"""
     
     print("=== 服务器资源检测 ===")
-    print(f"CPU核心数: {cpu_count()}")
-    
-    if GPU_AVAILABLE:
-        print(f"GPU数量: {cp.cuda.runtime.getDeviceCount()}")
-        try:
-            for i in range(min(4, cp.cuda.runtime.getDeviceCount())):  # 只检测前4个GPU
-                cp.cuda.Device(i).use()
-                meminfo = cp.cuda.runtime.memGetInfo()
-                print(f"GPU {i}: {meminfo[1]//1024**3:.1f}GB total, {meminfo[0]//1024**3:.1f}GB free")
-        except:
-            print("GPU信息获取失败")
+    total_cores = cpu_count()
+    print(f"CPU核心数: {total_cores}")
+    print("GPU不可用，使用CPU多核并行计算")
     
     n_samples = len(target_samples)
     n_params = len(uav_names) * 4
     
-    # 智能选择计算策略
-    if GPU_AVAILABLE and n_samples > 2000:
-        print("策略: GPU加速 + CPU并行")
-        calc_func = calc_shield_time_gpu_accelerated
-        n_workers = min(56, cpu_count() // 2)
-    elif cpu_count() >= 50:
+    # 根据CPU核心数选择策略
+    if total_cores >= 100:
+        print("策略: 超高度CPU并行 (大型服务器)")
+        n_workers = min(60, int(total_cores * 0.6))  # 保留40%给其他任务
+        calc_func = calc_total_shield_time_parallel
+    elif total_cores >= 50:
         print("策略: 高度CPU并行")
+        n_workers = min(32, int(total_cores * 0.7))
         calc_func = calc_total_shield_time_parallel
-        n_workers = min(80, int(cpu_count() * 0.7))
-    elif cpu_count() >= 8:
-        print("策略: 标准并行")
+    elif total_cores >= 16:
+        print("策略: 中度CPU并行")
+        n_workers = min(12, total_cores - 2)
         calc_func = calc_total_shield_time_parallel
-        n_workers = min(cpu_count() - 2, 16)
     else:
-        print("策略: 标准计算")
-        calc_func = calc_total_shield_time_multi_uav
-        n_workers = 1
+        print("策略: 轻度并行")
+        n_workers = max(1, total_cores // 2)
+        calc_func = calc_total_shield_time_parallel
+    
+    print(f"优化使用CPU核心数: {n_workers}")
     
     # 参数边界
     bounds = [(70, 140), (0.1, 5.0), (0.1, 5.0), (0, 360)] * len(uav_names)
     
     def objective(params):
-        return -calc_func(params, uav_names, target_samples)
+        return -calc_func(params, uav_names, target_samples, n_jobs=max(1, n_workers//2))
     
     print(f"\n=== 开始多阶段优化 ===")
     print(f"优化参数数量: {len(bounds)}")
@@ -509,13 +373,13 @@ def ultimate_optimization_strategy(uav_names, target_samples):
     start_time = time.time()
     
     # 阶段1: 快速全局搜索
-    print("\n阶段1: 快速全局搜索 (30%的计算量)...")
+    print("\n阶段1: 快速全局搜索...")
     result1 = differential_evolution(
         objective,
         bounds,
-        maxiter=50,
-        popsize=15,
-        workers=max(1, n_workers//2) if n_workers > 1 else 1,
+        maxiter=30,  # 减少迭代次数
+        popsize=12,  # 减少种群大小
+        workers=max(1, n_workers//4) if n_workers > 4 else 1,
         seed=42,
         disp=True
     )
@@ -524,14 +388,14 @@ def ultimate_optimization_strategy(uav_names, target_samples):
     print(f"阶段1完成，用时: {stage1_time:.2f}秒，最优值: {-result1.fun:.6f}")
     
     # 阶段2: 精细搜索
-    print("\n阶段2: 基于最优结果的精细搜索 (70%的计算量)...")
+    print("\n阶段2: 精细搜索...")
     
-    # 缩小搜索范围到最优解附近
+    # 缩小搜索范围
     best_params = result1.x
     refined_bounds = []
     for i, (low, high) in enumerate(bounds):
         center = best_params[i]
-        range_size = (high - low) * 0.15  # 缩小到15%范围
+        range_size = (high - low) * 0.2  # 缩小到20%范围
         new_low = max(low, center - range_size/2)
         new_high = min(high, center + range_size/2)
         refined_bounds.append((new_low, new_high))
@@ -539,8 +403,8 @@ def ultimate_optimization_strategy(uav_names, target_samples):
     result2 = differential_evolution(
         objective,
         refined_bounds,
-        maxiter=100,
-        popsize=25,
+        maxiter=80,  # 更多迭代用于精细搜索
+        popsize=20,
         workers=n_workers if n_workers > 1 else 1,
         seed=43,
         polish=True,
@@ -558,7 +422,7 @@ def ultimate_optimization_strategy(uav_names, target_samples):
         print(f"\n初始搜索结果更优: {-result1.fun:.6f}")
     
     print(f"总优化时间: {total_time:.2f}秒")
-    print(f"平均每次评估时间: {total_time/(result1.nfev + result2.nfev):.4f}秒")
+    print(f"函数评估次数: {result1.nfev + result2.nfev}")
     
     return final_result
 
@@ -566,13 +430,13 @@ def optimize_multi_uav(uav_names, target_samples):
     """优化多架无人机参数 - 主要接口函数"""
     return ultimate_optimization_strategy(uav_names, target_samples)
 
-# -------------------------- 8. 主程序 --------------------------
+# -------------------------- 7. 主程序 --------------------------
 if __name__ == "__main__":
-    print("=== 多无人机协同烟幕干扰优化系统 (高性能版本) ===")
+    print("=== 多无人机协同烟幕干扰优化系统 (CPU高性能版本) ===")
     
     # 生成目标采样点
     print("\n生成真目标采样点...")
-    target_samples = generate_high_density_samples(real_target, num_circle=60, num_height=20)
+    target_samples = generate_high_density_samples(real_target, num_circle=50, num_height=15)  # 减少采样点数
     print(f"生成真目标采样点：{len(target_samples)}个")
     
     # 选择参与任务的无人机
@@ -621,7 +485,7 @@ if __name__ == "__main__":
                 fake_target, angle, uav_pos
             )
             
-            # 计算单架无人机的贡献时间（用于参考）
+            # 计算单架无人机的贡献时间
             single_shield_time = calc_total_shield_time_multi_uav(
                 [speed, drop_delay, det_delay, angle], 
                 [uav_name], 
@@ -659,13 +523,15 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"\n保存Excel文件失败: {e}")
             # 保存为CSV作为备选
-            df.to_csv("result2.csv", index=False)
-            print("已保存为CSV格式: result2.csv")
+            try:
+                df.to_csv("result2.csv", index=False)
+                print("已保存为CSV格式: result2.csv")
+            except Exception as e2:
+                print(f"CSV保存也失败: {e2}")
         
         print(f"\n*** 协同总遮蔽时间：{-result.fun:.6f} 秒 ***")
         
     else:
         print("优化失败:", result.message)
-        print("尝试降低计算精度或减少优化参数...")
 
     print(f"\n程序执行完毕，总用时: {time.time() - start_total:.2f} 秒")
