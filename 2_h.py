@@ -1,6 +1,8 @@
 import numpy as np
 import time
 from itertools import product
+from multiprocessing import Pool, cpu_count
+import functools
 
 # -------------------------- 1. 常量与初始参数定义 --------------------------
 g = 9.80665  # 重力加速度 (m/s²)
@@ -42,7 +44,6 @@ dt = 0.01  # 时间步长（适度精度以提高搜索效率）
 # -------------------------- 2. 核心位置计算函数 --------------------------
 def calc_drop_point(uav_init_pos, uav_speed, drop_delay, flight_direction):
     """计算烟幕弹投放点（无人机等高度飞行，指定方向）"""
-    # 投放点计算（z坐标保持不变）
     flight_dist = uav_speed * drop_delay
     drop_xy = uav_init_pos[:2] + flight_direction * flight_dist
     drop_z = uav_init_pos[2]  # 等高度飞行
@@ -52,7 +53,6 @@ def calc_drop_point(uav_init_pos, uav_speed, drop_delay, flight_direction):
 
 def calc_det_point(drop_point, uav_speed, det_delay, g, flight_direction):
     """计算烟幕弹起爆点（投放后水平沿无人机方向，竖直自由落体）"""
-    # 水平方向运动（继承无人机速度方向）
     horizontal_dist = uav_speed * det_delay
     det_xy = drop_point[:2] + flight_direction * horizontal_dist
     
@@ -185,72 +185,105 @@ def calculate_shield_time(uav_speed, drop_delay, det_delay, flight_direction):
         return 0.0
 
 
-# -------------------------- 6. 启发式搜索算法 --------------------------
-def heuristic_search():
-    """启发式搜索最优参数"""
-    print("开始启发式搜索...")
-    
-    best_params = None
+# -------------------------- 6. 并行计算辅助函数 --------------------------
+def evaluate_parameter_batch(param_batch):
+    """并行计算参数批次"""
     best_time = 0.0
-    search_history = []
+    best_params = None
     
-    # 第一阶段：粗网格搜索
-    print("第一阶段：粗网格搜索")
-    speed_candidates = np.linspace(70, 140, 15)
-    drop_delay_candidates = np.linspace(0.5, 5.0, 19)
-    det_delay_candidates = np.linspace(1.0, 8.0, 29)
-    
-    # 重点搜索朝向假目标的方向（这是问题1的方向）
+    # 基础方向向量（全局变量替代）
     uav_to_target = fake_target - fy1_param["init_pos"]
     base_direction = uav_to_target[:2] / np.linalg.norm(uav_to_target[:2])
     
-    # 在基础方向附近搜索
+    for speed, drop_delay, det_delay, angle_offset in param_batch:
+        # 计算飞行方向
+        cos_offset = np.cos(angle_offset)
+        sin_offset = np.sin(angle_offset)
+        flight_direction = np.array([
+            base_direction[0] * cos_offset - base_direction[1] * sin_offset,
+            base_direction[0] * sin_offset + base_direction[1] * cos_offset
+        ])
+        
+        shield_time = calculate_shield_time(speed, drop_delay, det_delay, flight_direction)
+        
+        if shield_time > best_time:
+            best_time = shield_time
+            best_params = {
+                "speed": speed,
+                "drop_delay": drop_delay,
+                "det_delay": det_delay,
+                "flight_direction": flight_direction,
+                "angle_offset": angle_offset,
+                "shield_time": shield_time
+            }
+    
+    return best_params, best_time
+
+
+def create_parameter_batches(param_combinations, num_processes):
+    """将参数组合分割成批次用于并行处理"""
+    batch_size = len(param_combinations) // num_processes
+    batches = []
+    
+    for i in range(0, len(param_combinations), batch_size):
+        batch = param_combinations[i:i + batch_size]
+        if batch:  # 确保批次不为空
+            batches.append(batch)
+    
+    return batches
+
+
+# -------------------------- 7. 并行启发式搜索算法 --------------------------
+def parallel_heuristic_search():
+    """并行启发式搜索最优参数"""
+    num_processes = cpu_count()
+    print(f"开始并行启发式搜索...（使用 {num_processes} 个CPU核心）")
+    
+    best_params = None
+    best_time = 0.0
+    
+    # 第一阶段：并行粗网格搜索
+    print("第一阶段：并行粗网格搜索")
+    speed_candidates = np.linspace(70, 140, 15)
+    drop_delay_candidates = np.linspace(0.5, 5.0, 19)
+    det_delay_candidates = np.linspace(1.0, 8.0, 29)
     angle_offsets = np.linspace(-np.pi/4, np.pi/4, 17)  # ±45度范围
     
-    stage1_count = 0
-    total_stage1 = len(speed_candidates) * len(drop_delay_candidates) * len(det_delay_candidates) * len(angle_offsets)
+    # 生成所有参数组合
+    param_combinations = list(product(speed_candidates, drop_delay_candidates, 
+                                    det_delay_candidates, angle_offsets))
+    total_combinations = len(param_combinations)
+    print(f"总参数组合数: {total_combinations}")
     
-    for speed in speed_candidates:
-        for drop_delay in drop_delay_candidates:
-            for det_delay in det_delay_candidates:
-                for angle_offset in angle_offsets:
-                    # 计算飞行方向
-                    cos_offset = np.cos(angle_offset)
-                    sin_offset = np.sin(angle_offset)
-                    flight_direction = np.array([
-                        base_direction[0] * cos_offset - base_direction[1] * sin_offset,
-                        base_direction[0] * sin_offset + base_direction[1] * cos_offset
-                    ])
-                    
-                    shield_time = calculate_shield_time(speed, drop_delay, det_delay, flight_direction)
-                    
-                    if shield_time > best_time:
-                        best_time = shield_time
-                        best_params = {
-                            "speed": speed,
-                            "drop_delay": drop_delay,
-                            "det_delay": det_delay,
-                            "flight_direction": flight_direction,
-                            "angle_offset": angle_offset
-                        }
-                        print(f"新最优解：遮蔽时长 = {best_time:.4f}s")
-                        print(f"  速度: {speed:.1f} m/s")
-                        print(f"  投放延时: {drop_delay:.2f} s")
-                        print(f"  起爆延时: {det_delay:.2f} s")
-                        print(f"  角度偏移: {np.degrees(angle_offset):.1f}°")
-                    
-                    stage1_count += 1
-                    if stage1_count % 1000 == 0:
-                        print(f"第一阶段进度: {stage1_count}/{total_stage1} ({100*stage1_count/total_stage1:.1f}%)")
+    # 创建参数批次
+    param_batches = create_parameter_batches(param_combinations, num_processes)
+    print(f"分割为 {len(param_batches)} 个批次进行并行处理")
+    
+    # 并行执行
+    start_time = time.time()
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(evaluate_parameter_batch, param_batches)
+    stage1_time = time.time() - start_time
+    
+    # 收集结果
+    for result_params, result_time in results:
+        if result_params and result_time > best_time:
+            best_time = result_time
+            best_params = result_params
+            print(f"新最优解：遮蔽时长 = {best_time:.4f}s")
+            print(f"  速度: {best_params['speed']:.1f} m/s")
+            print(f"  投放延时: {best_params['drop_delay']:.2f} s")
+            print(f"  起爆延时: {best_params['det_delay']:.2f} s")
+            print(f"  角度偏移: {np.degrees(best_params['angle_offset']):.1f}°")
+    
+    print(f"第一阶段完成，用时: {stage1_time:.2f}秒，最佳遮蔽时长: {best_time:.4f}s")
     
     if best_params is None:
         print("第一阶段未找到有效解")
         return None
     
-    print(f"第一阶段完成，最佳遮蔽时长: {best_time:.4f}s")
-    
-    # 第二阶段：局部精细搜索
-    print("\n第二阶段：局部精细搜索")
+    # 第二阶段：并行局部精细搜索
+    print("\n第二阶段：并行局部精细搜索")
     
     # 在最佳参数附近进行精细搜索
     speed_range = [max(70, best_params["speed"] - 10), min(140, best_params["speed"] + 10)]
@@ -263,43 +296,31 @@ def heuristic_search():
     det_delay_fine = np.linspace(det_delay_range[0], det_delay_range[1], 21)
     angle_fine = np.linspace(angle_range[0], angle_range[1], 13)
     
-    stage2_count = 0
-    total_stage2 = len(speed_fine) * len(drop_delay_fine) * len(det_delay_fine) * len(angle_fine)
+    # 生成精细搜索参数组合
+    fine_combinations = list(product(speed_fine, drop_delay_fine, det_delay_fine, angle_fine))
+    fine_batches = create_parameter_batches(fine_combinations, num_processes)
+    print(f"精细搜索组合数: {len(fine_combinations)}, 分割为 {len(fine_batches)} 个批次")
     
-    for speed in speed_fine:
-        for drop_delay in drop_delay_fine:
-            for det_delay in det_delay_fine:
-                for angle_offset in angle_fine:
-                    cos_offset = np.cos(angle_offset)
-                    sin_offset = np.sin(angle_offset)
-                    flight_direction = np.array([
-                        base_direction[0] * cos_offset - base_direction[1] * sin_offset,
-                        base_direction[0] * sin_offset + base_direction[1] * cos_offset
-                    ])
-                    
-                    shield_time = calculate_shield_time(speed, drop_delay, det_delay, flight_direction)
-                    
-                    if shield_time > best_time:
-                        best_time = shield_time
-                        best_params = {
-                            "speed": speed,
-                            "drop_delay": drop_delay,
-                            "det_delay": det_delay,
-                            "flight_direction": flight_direction,
-                            "angle_offset": angle_offset
-                        }
-                        print(f"新最优解：遮蔽时长 = {best_time:.4f}s")
-                    
-                    stage2_count += 1
-                    if stage2_count % 500 == 0:
-                        print(f"第二阶段进度: {stage2_count}/{total_stage2} ({100*stage2_count/total_stage2:.1f}%)")
+    # 并行执行精细搜索
+    start_time = time.time()
+    with Pool(processes=num_processes) as pool:
+        fine_results = pool.map(evaluate_parameter_batch, fine_batches)
+    stage2_time = time.time() - start_time
     
-    print(f"第二阶段完成，最终最佳遮蔽时长: {best_time:.4f}s")
+    # 收集精细搜索结果
+    for result_params, result_time in fine_results:
+        if result_params and result_time > best_time:
+            best_time = result_time
+            best_params = result_params
+            print(f"精细搜索新最优解：遮蔽时长 = {best_time:.4f}s")
+    
+    print(f"第二阶段完成，用时: {stage2_time:.2f}秒，最终最佳遮蔽时长: {best_time:.4f}s")
+    print(f"总并行搜索用时: {stage1_time + stage2_time:.2f}秒")
     
     return best_params, best_time
 
 
-# -------------------------- 7. 主程序 --------------------------
+# -------------------------- 8. 主程序 --------------------------
 if __name__ == "__main__":
     print("="*80)
     print("问题1：固定参数计算")
@@ -313,12 +334,12 @@ if __name__ == "__main__":
     print(f"问题1结果：固定参数下的遮蔽时长 = {fixed_time:.4f}秒")
     
     print("\n" + "="*80)
-    print("问题2：启发式搜索优化")
+    print("问题2：并行启发式搜索优化")
     print("="*80)
     
-    # 问题2：启发式搜索
+    # 问题2：并行启发式搜索
     start_time = time.time()
-    result = heuristic_search()
+    result = parallel_heuristic_search()
     end_time = time.time()
     
     if result:
@@ -355,7 +376,14 @@ if __name__ == "__main__":
         
         improvement = (best_time - fixed_time) / fixed_time * 100
         print(f"\n相比问题1的改进: +{improvement:.2f}%")
-        print(f"搜索用时: {end_time - start_time:.2f} 秒")
+        print(f"总搜索用时: {end_time - start_time:.2f} 秒")
+        
+        # 性能分析
+        sequential_estimate = (end_time - start_time) * cpu_count()
+        speedup = sequential_estimate / (end_time - start_time)
+        efficiency = speedup / cpu_count() * 100
+        print(f"并行加速比: {speedup:.1f}x")
+        print(f"并行效率: {efficiency:.1f}%")
         
     else:
         print("未找到有效解")
