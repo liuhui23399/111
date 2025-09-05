@@ -2,14 +2,13 @@ import numpy as np
 from scipy.optimize import differential_evolution
 import time
 import multiprocessing as mp
-from functools import partial
-from joblib import Parallel, delayed  # 更好的并行库
+from joblib import Parallel, delayed
 
 # Constants from 1.py
 g = 9.80665
 epsilon = 1e-12
 
-# Problem parameters (保持不变)
+# Problem parameters
 fake_target = np.array([0.0, 0.0, 0.0])
 real_target = {
     "center": np.array([0.0, 200.0, 0.0]),
@@ -32,139 +31,169 @@ fy1_param = {
     "init_pos": np.array([17800.0, 0.0, 1800.0]),
 }
 
-def calc_trajectory_points(angle, speed, drop_delay, det_delay):
-    """Calculate drop and detonation points"""
-    uav_dir = np.array([np.cos(angle), np.sin(angle), 0.0])
-    drop_point = fy1_param["init_pos"] + uav_dir * speed * drop_delay
-    
-    horizontal_dist = speed * det_delay
-    det_xy = drop_point[:2] + uav_dir[:2] * horizontal_dist
-    det_z = drop_point[2] - 0.5 * g * det_delay ** 2
-    det_point = np.array([det_xy[0], det_xy[1], det_z])
-    
-    return drop_point, det_point
+def calc_drop_point(uav_init_pos, uav_dir, uav_speed, drop_delay):
+    """计算烟幕弹投放点（与2.py保持一致）"""
+    flight_dist = uav_speed * drop_delay
+    drop_point = uav_init_pos + uav_dir * flight_dist
+    return drop_point
 
-def generate_target_samples(target, density="high"):
-    """Generate target sampling points"""
-    center = target["center"]
-    r = target["r"] 
-    h = target["h"]
+def calc_det_point(drop_point, uav_dir, uav_speed, det_delay, g):
+    """计算烟幕弹起爆点（与2.py保持一致）"""
+    horizontal_dist = uav_speed * det_delay
+    det_xy = drop_point[:2] + uav_dir[:2] * horizontal_dist
     
-    if density == "low":
-        num_circle, num_height = 8, 4
-    elif density == "medium":
-        num_circle, num_height = 16, 8
-    else:  # high
-        num_circle, num_height = 24, 12
+    drop_h = 0.5 * g * det_delay ** 2
+    det_z = drop_point[2] - drop_h
     
+    return np.array([det_xy[0], det_xy[1], det_z])
+
+def generate_medium_density_samples(target, num_circle=20, num_height=8):
+    """生成中等密度目标采样点（与2.py类似精度）"""
     samples = []
-    angles = np.linspace(0, 2*np.pi, num_circle, endpoint=False)
-    heights = np.linspace(center[2], center[2] + h, num_height)
+    center = target["center"]
+    r = target["r"]
+    h = target["h"]
+    center_xy = center[:2]
+    min_z = center[2]
+    max_z = center[2] + h
     
-    # Surface sampling
+    # 外表面采样
+    theta = np.linspace(0, 2*np.pi, num_circle, endpoint=False)
+    heights = np.linspace(min_z, max_z, num_height, endpoint=True)
+    
+    # 底面和顶面
+    for th in theta:
+        x = center_xy[0] + r * np.cos(th)
+        y = center_xy[1] + r * np.sin(th)
+        samples.append([x, y, min_z])
+        samples.append([x, y, max_z])
+    
+    # 侧面
     for z in heights:
-        for angle in angles:
-            x = center[0] + r * np.cos(angle)
-            y = center[1] + r * np.sin(angle)
+        for th in theta:
+            x = center_xy[0] + r * np.cos(th)
+            y = center_xy[1] + r * np.sin(th)
             samples.append([x, y, z])
     
-    # Add center axis points
-    for z in heights:
-        samples.append([center[0], center[1], z])
+    # 中轴线关键点
+    samples.extend([
+        [center_xy[0], center_xy[1], min_z],
+        [center_xy[0], center_xy[1], min_z + h/2],
+        [center_xy[0], center_xy[1], max_z]
+    ])
     
     return np.array(samples)
 
-def line_sphere_intersect(start, end, sphere_center, radius):
-    """Enhanced line-sphere intersection test"""
-    d = end - start
-    f = start - sphere_center
+def is_segment_intersect_sphere(M, P, C, r):
+    """线段-球相交判定（与2.py保持一致）"""
+    MP = P - M
+    MC = C - M
     
-    a = np.dot(d, d)
+    a = np.dot(MP, MP)
     if a < epsilon:
-        return np.linalg.norm(f) <= radius * 1.001
+        return np.linalg.norm(MC) <= r + epsilon
     
-    b = 2 * np.dot(f, d)
-    c = np.dot(f, f) - (radius * 1.001) ** 2
+    b = -2 * np.dot(MP, MC)
+    c = np.dot(MC, MC) - r ** 2
     
-    discriminant = b * b - 4 * a * c
-    if discriminant < 0:
+    discriminant = b ** 2 - 4 * a * c
+    if discriminant < -epsilon:
         return False
     
+    if discriminant < 0:
+        discriminant = 0
+    
     sqrt_d = np.sqrt(discriminant)
-    t1 = (-b - sqrt_d) / (2 * a)
-    t2 = (-b + sqrt_d) / (2 * a)
+    s1 = (-b - sqrt_d) / (2 * a)
+    s2 = (-b + sqrt_d) / (2 * a)
     
-    return (t1 <= 1.001 and t1 >= -0.001) or (t2 <= 1.001 and t2 >= -0.001) or (t1 < -0.001 and t2 > 1.001)
+    return (s1 <= 1.0 + epsilon) and (s2 >= -epsilon)
 
-def evaluate_single_timepoint(t, missile_dir, t_det, det_point, target_samples):
-    """评估单个时间点的遮蔽情况（用于并行化）"""
-    missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
-    
-    sink_time = t - t_det
-    smoke_center = np.array([
-        det_point[0],
-        det_point[1], 
-        det_point[2] - smoke_param["sink_speed"] * sink_time
-    ])
-    
-    # Check if all target points are shielded
-    for target_point in target_samples:
-        if not line_sphere_intersect(missile_pos, target_point, smoke_center, smoke_param["r"]):
+def is_target_shielded(missile_pos, smoke_center, smoke_r, target_samples):
+    """判定目标是否被遮蔽（与2.py保持一致）"""
+    for p in target_samples:
+        if not is_segment_intersect_sphere(missile_pos, p, smoke_center, smoke_r):
             return False
     return True
 
-def evaluate_shielding_time_parallel(params, time_resolution=2000, n_jobs=-1):
-    """并行化的遮蔽时间评估函数"""
-    angle, speed, drop_delay, det_delay = params
+def evaluate_shielding_moderate(params):
+    """中等精度的遮蔽时间评估（类似2.py的精度）"""
+    dir_angle, speed, drop_delay, det_delay = params
     
-    # Parameter validation
-    if not (70 <= speed <= 140 and 0.05 <= drop_delay <= 10 and 0.05 <= det_delay <= 10):
+    # 参数验证
+    if not (70 <= speed <= 140 and 0.1 <= drop_delay <= 10 and 0.1 <= det_delay <= 10):
         return 0
     
     try:
-        drop_point, det_point = calc_trajectory_points(angle, speed, drop_delay, det_delay)
+        # 将角度转换为方向向量
+        dir_xy = np.array([np.cos(dir_angle), np.sin(dir_angle)])
+        uav_dir = np.array([dir_xy[0], dir_xy[1], 0.0])
         
-        # Missile trajectory
-        missile_dir = (fake_target - missile_m1["init_pos"]) / np.linalg.norm(fake_target - missile_m1["init_pos"])
-        
-        # Time window
-        t_det = drop_delay + det_delay
-        t_end = t_det + smoke_param["valid_time"]
-        
-        # Time sampling
-        time_samples = np.linspace(t_det, t_end, time_resolution)
-        target_samples = generate_target_samples(real_target, "medium")
-        dt = (t_end - t_det) / (time_resolution - 1) if time_resolution > 1 else 0
-        
-        # 并行评估每个时间点
-        if n_jobs == -1:
-            n_jobs = min(mp.cpu_count(), 56)  # 限制并行数避免过载
-        
-        results = Parallel(n_jobs=n_jobs, backend='threading')(
-            delayed(evaluate_single_timepoint)(t, missile_dir, t_det, det_point, target_samples) 
-            for t in time_samples
+        # 计算投放点和起爆点
+        drop_point = calc_drop_point(
+            uav_init_pos=fy1_param["init_pos"],
+            uav_dir=uav_dir,
+            uav_speed=speed,
+            drop_delay=drop_delay
         )
         
-        # 计算有效时间
-        valid_time = sum(results) * dt
-        return valid_time
+        det_point = calc_det_point(
+            drop_point=drop_point,
+            uav_dir=uav_dir,
+            uav_speed=speed,
+            det_delay=det_delay,
+            g=g
+        )
+        
+        # 导弹方向计算
+        missile_vec = fake_target - missile_m1["init_pos"]
+        missile_dir = missile_vec / np.linalg.norm(missile_vec)
+        
+        # 时间窗口
+        t_det = drop_delay + det_delay
+        t_start = t_det
+        t_end = t_det + smoke_param["valid_time"]
+        
+        # 使用中等密度时间采样（类似2.py的精度）
+        dt = 0.001  # 1毫秒精度
+        t_list = np.arange(t_start, t_end + dt, dt)
+        
+        # 生成中等密度目标采样点
+        target_samples = generate_medium_density_samples(real_target, num_circle=30, num_height=10)
+        
+        # 计算遮蔽时间
+        valid_total = 0.0
+        
+        for t in t_list:
+            missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
+            sink_time = t - t_det
+            smoke_center = np.array([
+                det_point[0],
+                det_point[1],
+                det_point[2] - smoke_param["sink_speed"] * sink_time
+            ])
+            
+            if is_target_shielded(missile_pos, smoke_center, smoke_param["r"], target_samples):
+                valid_total += dt
+        
+        return valid_total
         
     except:
         return 0
 
-def objective_function_parallel(params):
-    """并行化的目标函数"""
-    return -evaluate_shielding_time_parallel(params, time_resolution=3000)
+def objective_function_moderate(params):
+    """目标函数"""
+    return -evaluate_shielding_moderate(params)
 
-def ultra_parallel_grid_search(angle_range, speed_range, drop_range, det_range, n_jobs=-1):
-    """超并行网格搜索"""
-    print(f"Starting ultra-parallel grid search...")
+def parallel_grid_search_moderate(angle_range, speed_range, drop_range, det_range, n_jobs=-1):
+    """中等精度的并行网格搜索"""
+    print(f"Starting moderate precision parallel grid search...")
     
-    # Create parameter combinations
-    angles = np.linspace(angle_range[0], angle_range[1], 25)
-    speeds = np.linspace(speed_range[0], speed_range[1], 20)
-    drop_delays = np.linspace(drop_range[0], drop_range[1], 25)
-    det_delays = np.linspace(det_range[0], det_range[1], 25)
+    # 创建参数组合（适中的网格密度）
+    angles = np.linspace(angle_range[0], angle_range[1], 20)  # 降低到20个角度
+    speeds = np.linspace(speed_range[0], speed_range[1], 15)  # 15个速度
+    drop_delays = np.linspace(drop_range[0], drop_range[1], 20)  # 20个投放延迟
+    det_delays = np.linspace(det_range[0], det_range[1], 20)   # 20个起爆延迟
     
     param_combinations = []
     for angle in angles:
@@ -173,65 +202,65 @@ def ultra_parallel_grid_search(angle_range, speed_range, drop_range, det_range, 
                 for det_delay in det_delays:
                     param_combinations.append([angle, speed, drop_delay, det_delay])
     
-    print(f"Evaluating {len(param_combinations)} parameter combinations with ultra-parallelization...")
+    print(f"Evaluating {len(param_combinations)} parameter combinations...")
     
-    # 超并行评估 - 使用所有可用核心
+    # 并行评估
     if n_jobs == -1:
-        n_jobs = mp.cpu_count()
+        n_jobs = min(mp.cpu_count(), 32)  # 限制核心数
     
     start_time = time.time()
     results = Parallel(n_jobs=n_jobs, backend='multiprocessing', verbose=1)(
-        delayed(evaluate_shielding_time_parallel)(params, 2000, 1) for params in param_combinations
+        delayed(evaluate_shielding_moderate)(params) for params in param_combinations
     )
     
     print(f"Grid search completed in {time.time() - start_time:.2f} seconds")
     
-    # Find best result
+    # 找到最佳结果
     best_idx = np.argmax(results)
     best_params = param_combinations[best_idx]
     best_score = results[best_idx]
     
     return best_params, best_score
 
-def adaptive_optimization_enhanced():
-    """增强的自适应多阶段优化"""
-    print("=== Enhanced Adaptive Multi-Stage Optimization ===")
-    print(f"Using {mp.cpu_count()} CPU cores for maximum parallelization")
+def moderate_optimization():
+    """中等精度的多阶段优化"""
+    print("=== Moderate Precision Multi-Stage Optimization ===")
+    print(f"Using {mp.cpu_count()} CPU cores with moderate precision")
     
-    # Stage 1: 超并行网格搜索
-    print("\nStage 1: Ultra-parallel grid search...")
-    stage1_params, stage1_score = ultra_parallel_grid_search(
+    # 第一阶段：并行网格搜索
+    print("\nStage 1: Parallel grid search...")
+    stage1_params, stage1_score = parallel_grid_search_moderate(
         angle_range=(2.8, 3.4),  # 基于之前结果聚焦170-190度
-        speed_range=(70, 100),
-        drop_range=(0.05, 2.0),
-        det_range=(0.05, 3.0),
-        n_jobs=-1  # 使用所有核心
+        speed_range=(70, 120),
+        drop_range=(0.1, 3.0),
+        det_range=(0.5, 5.0),
+        n_jobs=-1
     )
     
-    print(f"Stage 1 best: {stage1_score:.6f}s at angle={np.degrees(stage1_params[0]):.2f}°")
+    print(f"Stage 1 best: {stage1_score:.4f}s at angle={np.degrees(stage1_params[0]):.2f}°")
     
-    # Stage 2: 并行差分进化
-    print("\nStage 2: Parallel differential evolution...")
+    # 第二阶段：差分进化优化
+    print("\nStage 2: Differential evolution...")
     
-    margin = [0.15, 8, 0.4, 0.4]
+    margin = [0.2, 10, 0.5, 0.5]
     bounds = [
         (max(0, stage1_params[0] - margin[0]), min(2*np.pi, stage1_params[0] + margin[0])),
         (max(70, stage1_params[1] - margin[1]), min(140, stage1_params[1] + margin[1])),
-        (max(0.05, stage1_params[2] - margin[2]), min(10, stage1_params[2] + margin[2])),
-        (max(0.05, stage1_params[3] - margin[3]), min(10, stage1_params[3] + margin[3]))
+        (max(0.1, stage1_params[2] - margin[2]), min(10, stage1_params[2] + margin[2])),
+        (max(0.1, stage1_params[3] - margin[3]), min(10, stage1_params[3] + margin[3]))
     ]
     
     result = differential_evolution(
-        objective_function_parallel,
+        objective_function_moderate,
         bounds,
-        popsize=25,
-        maxiter=80,
+        popsize=20,  # 适中的种群大小
+        maxiter=50,  # 适中的迭代次数
         disp=True,
-        workers=min(mp.cpu_count()//2, 56),  # 使用一半核心避免过载
+        workers=min(mp.cpu_count()//2, 16),  # 适中的并行度
         seed=42,
         x0=stage1_params,
-        atol=1e-7,
-        tol=1e-7
+        atol=1e-6,
+        tol=1e-6
     )
     
     stage2_params = result.x
@@ -239,51 +268,65 @@ def adaptive_optimization_enhanced():
     
     print(f"Stage 2 best: {stage2_score:.6f}s")
     
-    # Stage 3: 超高精度并行评估
-    print("\nStage 3: Ultra-precise parallel evaluation...")
-    final_score = evaluate_shielding_time_parallel(stage2_params, time_resolution=8000, n_jobs=-1)
-    
-    return stage2_params, final_score
+    return stage2_params, stage2_score
 
-def detailed_parallel_evaluation(params):
-    """并行化的详细评估"""
+def detailed_evaluation_moderate(params):
+    """中等精度的详细评估"""
     angle, speed, drop_delay, det_delay = params
     
-    print(f"Detailed parallel evaluation: angle={np.degrees(angle):.3f}°, speed={speed:.3f}, "
+    print(f"Detailed evaluation: angle={np.degrees(angle):.3f}°, speed={speed:.3f}, "
           f"drop={drop_delay:.4f}s, det={det_delay:.4f}s")
     
-    drop_point, det_point = calc_trajectory_points(angle, speed, drop_delay, det_delay)
+    # 将角度转换为方向向量
+    dir_xy = np.array([np.cos(angle), np.sin(angle)])
+    uav_dir = np.array([dir_xy[0], dir_xy[1], 0.0])
+    
+    drop_point = calc_drop_point(fy1_param["init_pos"], uav_dir, speed, drop_delay)
+    det_point = calc_det_point(drop_point, uav_dir, speed, det_delay, g)
     missile_dir = (fake_target - missile_m1["init_pos"]) / np.linalg.norm(fake_target - missile_m1["init_pos"])
     
     t_det = drop_delay + det_delay
     t_end = t_det + smoke_param["valid_time"]
     
-    # 超高分辨率时间采样
-    dt = 0.0005
-    t_list = np.arange(t_det, t_end + dt, dt)
-    target_samples = generate_target_samples(real_target, "high")
+    # 精细时间采样（类似2.py的最终验证）
+    fine_dt = 0.0001
+    t_list = np.arange(t_det, t_end + fine_dt, fine_dt)
+    target_samples = generate_medium_density_samples(real_target, num_circle=40, num_height=15)
     
     print(f"Evaluating {len(t_list)} time points with {len(target_samples)} target samples...")
     
-    # 并行评估所有时间点
-    results = Parallel(n_jobs=-1, backend='threading', verbose=1)(
-        delayed(evaluate_single_timepoint)(t, missile_dir, t_det, det_point, target_samples) 
-        for t in t_list
-    )
-    
-    # 分析结果
-    valid_total = sum(results) * dt
+    valid_total = 0.0
     shield_segments = []
     prev_valid = False
     
-    for i, (t, current_valid) in enumerate(zip(t_list, results)):
+    for i, t in enumerate(t_list):
+        if i % 50000 == 0:
+            progress = 100 * i / len(t_list)
+            print(f"Progress: {progress:.1f}%")
+        
+        missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
+        
+        sink_time = t - t_det
+        smoke_center = np.array([
+            det_point[0],
+            det_point[1],
+            det_point[2] - smoke_param["sink_speed"] * sink_time
+        ])
+        
+        current_valid = is_target_shielded(missile_pos, smoke_center, smoke_param["r"], target_samples)
+        
+        if current_valid:
+            valid_total += fine_dt
+        
+        # 记录遮蔽时间段
         if current_valid and not prev_valid:
             shield_segments.append({"start": t})
         elif not current_valid and prev_valid and shield_segments:
-            shield_segments[-1]["end"] = t - dt
+            shield_segments[-1]["end"] = t - fine_dt
+        
         prev_valid = current_valid
     
-    # Handle final segment
+    # 处理最后一个遮蔽段
     if shield_segments and "end" not in shield_segments[-1]:
         shield_segments[-1]["end"] = t_end
     
@@ -291,45 +334,45 @@ def detailed_parallel_evaluation(params):
 
 if __name__ == "__main__":
     start_time = time.time()
-    print(f"Starting ULTRA-PARALLEL optimization with {mp.cpu_count()} CPU cores")
+    print(f"Starting MODERATE PRECISION optimization with {mp.cpu_count()} CPU cores")
     
-    # 运行增强的并行优化
-    opt_params, opt_score = adaptive_optimization_enhanced()
+    # 运行中等精度优化
+    opt_params, opt_score = moderate_optimization()
     
     print(f"\nOptimization completed in {time.time() - start_time:.2f} seconds")
-    print(f"Optimized shielding time: {opt_score:.8f} seconds")
+    print(f"Optimized shielding time: {opt_score:.6f} seconds")
     
-    # 并行详细评估
-    print("\nPerforming detailed parallel evaluation...")
-    final_time, drop_pt, det_pt, segments = detailed_parallel_evaluation(opt_params)
+    # 详细评估
+    print("\nPerforming detailed evaluation...")
+    final_time, drop_pt, det_pt, segments = detailed_evaluation_moderate(opt_params)
     
-    # Results summary
-    print("\n" + "="*80)
-    print("ULTRA-PARALLEL OPTIMIZATION RESULTS")
-    print("="*80)
-    print(f"Optimal flight angle: {np.degrees(opt_params[0]):.6f}°")
-    print(f"Optimal flight speed: {opt_params[1]:.6f} m/s")
-    print(f"Optimal drop delay: {opt_params[2]:.6f} s")
-    print(f"Optimal detonation delay: {opt_params[3]:.6f} s")
-    print(f"Drop point: [{drop_pt[0]:.6f}, {drop_pt[1]:.6f}, {drop_pt[2]:.6f}]")
-    print(f"Detonation point: [{det_pt[0]:.6f}, {det_pt[1]:.6f}, {det_pt[2]:.6f}]")
-    print(f"Maximum shielding time: {final_time:.8f} seconds")
-    print("="*80)
+    # 结果汇总
+    print("\n" + "="*70)
+    print("MODERATE PRECISION OPTIMIZATION RESULTS")
+    print("="*70)
+    print(f"Optimal flight angle: {np.degrees(opt_params[0]):.4f}°")
+    print(f"Optimal flight speed: {opt_params[1]:.4f} m/s")
+    print(f"Optimal drop delay: {opt_params[2]:.4f} s")
+    print(f"Optimal detonation delay: {opt_params[3]:.4f} s")
+    print(f"Drop point: [{drop_pt[0]:.4f}, {drop_pt[1]:.4f}, {drop_pt[2]:.4f}]")
+    print(f"Detonation point: [{det_pt[0]:.4f}, {det_pt[1]:.4f}, {det_pt[2]:.4f}]")
+    print(f"Maximum shielding time: {final_time:.6f} seconds")
+    print("="*70)
     
-    # Segment details
+    # 遮蔽时间段详情
     if segments:
         print("\nShielding time segments:")
         total_duration = 0
         for i, seg in enumerate(segments, 1):
             duration = seg["end"] - seg["start"]
             total_duration += duration
-            print(f"Segment {i}: {seg['start']:.6f}s ~ {seg['end']:.6f}s (duration: {duration:.6f}s)")
-        print(f"Total verified shielding time: {total_duration:.8f}s")
+            print(f"Segment {i}: {seg['start']:.4f}s ~ {seg['end']:.4f}s (duration: {duration:.4f}s)")
+        print(f"Total verified shielding time: {total_duration:.6f}s")
         
-        if final_time >= 4.75:
-            print(f"\n🎯 OUTSTANDING! {final_time:.8f}s - Extremely close to 4.8s!")
-        elif final_time >= 4.6:
-            print(f"\n📈 EXCELLENT! {final_time:.8f}s - Very close to 4.8s!")
+        if final_time >= 4.5:
+            print(f"\n🎯 EXCELLENT! {final_time:.6f}s - Great result!")
+        elif final_time >= 4.0:
+            print(f"\n📈 GOOD! {final_time:.6f}s - Solid performance!")
     
     print(f"\nTotal computation time: {time.time() - start_time:.2f} seconds")
-    print(f"FINAL ANSWER: Maximum shielding time = {final_time:.8f} seconds")
+    print(f"FINAL ANSWER: Maximum shielding time = {final_time:.6f} seconds")
