@@ -1,0 +1,177 @@
+(env_py311) root@ece2baa93ac4:/home/ssi335/model/111# python 2_optimized.py
+Starting ULTRA-PARALLEL optimization with 112 CPU cores
+=== Enhanced Adaptive Multi-Stage Optimization ===
+Using 112 CPU cores for maximum parallelization
+
+Stage 1: Ultra-parallel grid search...
+Starting ultra-parallel grid search...
+Evaluating 312500 parameter combinations with ultra-parallelization...
+[Parallel(n_jobs=112)]: Using backend MultiprocessingBackend with 112 concurrent workers.
+[Parallel(n_jobs=112)]: Done 242 tasks      | elapsed:    0.5s
+[Parallel(n_jobs=112)]: Done 1194 tasks      | elapsed:    1.0s
+[Parallel(n_jobs=112)]: Done 2984 tasks      | elapsed:    1.9s
+[Parallel(n_jobs=112)]: Done 5184 tasks      | elapsed:    3.0s
+[Parallel(n_jobs=112)]: Done 7784 tasks      | elapsed:    4.2s
+[Parallel(n_jobs=112)]: Done 10784 tasks      | elapsed:    5.7s
+[Parallel(n_jobs=112)]: Done 14184 tasks      | elapsed:    7.4s
+[Parallel(n_jobs=112)]: Done 17984 tasks      | elapsed:    9.3s
+[Parallel(n_jobs=112)]: Done 22184 tasks      | elapsed:   11.4s
+[Parallel(n_jobs=112)]: Done 26784 tasks      | elapsed:   13.6s
+[Parallel(n_jobs=112)]: Done 31784 tasks      | elapsed:   16.2s
+[Parallel(n_jobs=112)]: Done 37184 tasks      | elapsed:   18.8s
+[Parallel(n_jobs=112)]: Done 42984 tasks      | elapsed:   21.8s
+[Parallel(n_jobs=112)]: Done 49184 tasks      | elapsed:   24.9s
+[Parallel(n_jobs=112)]: Done 55784 tasks      | elapsed:   28.3s
+[Parallel(n_jobs=112)]: Done 62784 tasks      | elapsed:   31.9s
+[Parallel(n_jobs=112)]: Done 70184 tasks      | elapsed:   35.9s
+[Parallel(n_jobs=112)]: Done 77984 tasks      | elapsed:   40.0s
+[Parallel(n_jobs=112)]: Done 86184 tasks      | elapsed:   44.4s
+[Parallel(n_jobs=112)]: Done 94784 tasks      | elapsed:   49.2s
+[Parallel(n_jobs=112)]: Done 103784 tasks      | elapsed:   54.3s
+[Parallel(n_jobs=112)]: Done 113184 tasks      | elapsed:   59.7s
+[Parallel(n_jobs=112)]: Done 122984 tasks      | elapsed:  1.1min
+[Parallel(n_jobs=112)]: Done 133184 tasks      | elapsed:  1.2min
+[Parallel(n_jobs=112)]: Done 141876 tasks      | elapsed:  1.4min
+[Parallel(n_jobs=112)]: Done 147392 tasks      | elapsed:  1.5min
+[Parallel(n_jobs=112)]: Done 153092 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=112)]: Done 158992 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=112)]: Done 165092 tasks      | elapsed:  1.9min
+[Parallel(n_jobs=112)]: Done 171392 tasks      | elapsed:  2.1min
+[Parallel(n_jobs=112)]: Done 177892 tasks      | elapsed:  2.3min
+[Parallel(n_jobs=112)]: Done 184592 tasks      | elapsed:  2.4min
+[Parallel(n_jobs=112)]: Done 191492 tasks      | elapsed:  2.5min
+[Parallel(n_jobs=112)]: Done 198592 tasks      | elapsed:  2.6min
+[Parallel(n_jobs=112)]: Done 205892 tasks      | elapsed:  2.7min
+[Parallel(n_jobs=112)]: Done 219808 tasks      | elapsed:  2.8min
+[Parallel(n_jobs=112)]: Done 235208 tasks      | elapsed:  2.9min
+[Parallel(n_jobs=112)]: Done 251008 tasks      | elapsed:  3.1min
+[Parallel(n_jobs=112)]: Done 267208 tasks      | elapsed:  3.2min
+[Parallel(n_jobs=112)]: Done 283808 tasks      | elapsed:  3.3min
+[Parallel(n_jobs=112)]: Done 300808 tasks      | elapsed:  3.5min
+[Parallel(n_jobs=112)]: Done 312500 out of 312500 | elapsed:  3.6min finished
+Grid search completed in 213.33 seconds
+Stage 1 best: 4.542271s at angle=177.62°
+
+Stage 2: Parallel differential evolution...
+/root/miniconda3/envs/env_py311/lib/python3.11/site-packages/scipy/optimize/_differentialevolution.py:487: UserWarning: differential_evolution: the 'workers' keyword has overridden updating='immediate' to updating='deferred'
+  with DifferentialEvolutionSolver(func, bounds, args=args,
+differential_evolution step 1: f(x)= -4.534844948316105
+differential_evolution step 2: f(x)= -4.534844948316105
+differential_evolution step 3: f(x)= -4.534844948316105
+differential_evolution step 4: f(x)= -4.534844948316105
+differential_evolution step 5: f(x)= -4.534844948316105
+differential_evolution step 6: f(x)= -4.534844948316105
+differential_evolution step 7: f(x)= -4.534844948316105
+differential_evolution step 8: f(x)= -4.541513837945982
+differential_evolution step 9: f(x)= -4.541513837945982
+differential_evolution step 10: f(x)= -4.541513837945982
+differential_evolution step 11: f(x)= -4.548182727575859
+differential_evolution step 12: f(x)= -4.548182727575859
+differential_evolution step 13: f(x)= -4.548182727575859
+differential_evolution step 14: f(x)= -4.548182727575859
+differential_evolution step 15: f(x)= -4.548182727575859
+differential_evolution step 16: f(x)= -4.548182727575859
+differential_evolution step 17: f(x)= -4.548182727575859
+differential_evolution step 18: f(x)= -4.548182727575859
+differential_evolution step 19: f(x)= -4.548182727575859
+differential_evolution step 20: f(x)= -4.548182727575859
+differential_evolution step 21: f(x)= -4.548182727575859
+differential_evolution step 22: f(x)= -4.548182727575859
+differential_evolution step 23: f(x)= -4.548182727575859
+differential_evolution step 24: f(x)= -4.548182727575859
+differential_evolution step 25: f(x)= -4.548182727575859
+differential_evolution step 26: f(x)= -4.548182727575859
+differential_evolution step 27: f(x)= -4.548182727575859
+differential_evolution step 28: f(x)= -4.548182727575859
+differential_evolution step 29: f(x)= -4.548182727575859
+differential_evolution step 30: f(x)= -4.548182727575859
+differential_evolution step 31: f(x)= -4.548182727575859
+differential_evolution step 32: f(x)= -4.548182727575859
+differential_evolution step 33: f(x)= -4.548182727575859
+differential_evolution step 34: f(x)= -4.548182727575859
+differential_evolution step 35: f(x)= -4.548182727575859
+differential_evolution step 36: f(x)= -4.548182727575859
+differential_evolution step 37: f(x)= -4.548182727575859
+differential_evolution step 38: f(x)= -4.548182727575859
+differential_evolution step 39: f(x)= -4.548182727575859
+differential_evolution step 40: f(x)= -4.548182727575859
+differential_evolution step 41: f(x)= -4.548182727575859
+differential_evolution step 42: f(x)= -4.548182727575859
+differential_evolution step 43: f(x)= -4.548182727575859
+differential_evolution step 44: f(x)= -4.548182727575859
+differential_evolution step 45: f(x)= -4.548182727575859
+differential_evolution step 46: f(x)= -4.548182727575859
+differential_evolution step 47: f(x)= -4.548182727575859
+differential_evolution step 48: f(x)= -4.548182727575859
+differential_evolution step 49: f(x)= -4.548182727575859
+differential_evolution step 50: f(x)= -4.548182727575859
+differential_evolution step 51: f(x)= -4.548182727575859
+differential_evolution step 52: f(x)= -4.548182727575859
+differential_evolution step 53: f(x)= -4.548182727575859
+differential_evolution step 54: f(x)= -4.548182727575859
+differential_evolution step 55: f(x)= -4.548182727575859
+differential_evolution step 56: f(x)= -4.548182727575859
+differential_evolution step 57: f(x)= -4.548182727575859
+differential_evolution step 58: f(x)= -4.548182727575859
+differential_evolution step 59: f(x)= -4.548182727575859
+differential_evolution step 60: f(x)= -4.548182727575859
+differential_evolution step 61: f(x)= -4.548182727575859
+differential_evolution step 62: f(x)= -4.548182727575859
+Polishing solution with 'L-BFGS-B'
+Stage 2 best: 4.548183s
+
+Stage 3: Ultra-precise parallel evaluation...
+
+Optimization completed in 599.38 seconds
+Optimized shielding time: 4.54306788 seconds
+
+Performing detailed parallel evaluation...
+Detailed parallel evaluation: angle=176.839°, speed=70.838, drop=0.0680s, det=2.5291s
+Evaluating 40001 time points with 300 target samples...
+[Parallel(n_jobs=-1)]: Using backend ThreadingBackend with 112 concurrent workers.
+[Parallel(n_jobs=-1)]: Done 226 tasks      | elapsed:    2.9s
+[Parallel(n_jobs=-1)]: Done 576 tasks      | elapsed:    6.7s
+[Parallel(n_jobs=-1)]: Done 1026 tasks      | elapsed:   11.5s
+[Parallel(n_jobs=-1)]: Done 1576 tasks      | elapsed:   17.4s
+[Parallel(n_jobs=-1)]: Done 2226 tasks      | elapsed:   24.3s
+[Parallel(n_jobs=-1)]: Done 2976 tasks      | elapsed:   32.3s
+[Parallel(n_jobs=-1)]: Done 3826 tasks      | elapsed:   41.5s
+[Parallel(n_jobs=-1)]: Done 4776 tasks      | elapsed:   51.7s
+[Parallel(n_jobs=-1)]: Done 5826 tasks      | elapsed:  1.0min
+[Parallel(n_jobs=-1)]: Done 6976 tasks      | elapsed:  1.3min
+[Parallel(n_jobs=-1)]: Done 8226 tasks      | elapsed:  1.5min
+[Parallel(n_jobs=-1)]: Done 9576 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 11026 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 12576 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 14226 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 15976 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 17826 tasks      | elapsed:  1.6min
+[Parallel(n_jobs=-1)]: Done 19776 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 21826 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 23976 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 26226 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 28576 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 31026 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 33576 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 36226 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 38976 tasks      | elapsed:  1.7min
+[Parallel(n_jobs=-1)]: Done 40001 out of 40001 | elapsed:  1.7min finished
+
+================================================================================
+ULTRA-PARALLEL OPTIMIZATION RESULTS
+================================================================================
+Optimal flight angle: 176.838691°
+Optimal flight speed: 70.837750 m/s
+Optimal drop delay: 0.068007 s
+Optimal detonation delay: 2.529059 s
+Drop point: [17795.189870, 0.265670, 1800.000000]
+Detonation point: [17616.309677, 10.145458, 1768.637659]
+Maximum shielding time: 4.54250000 seconds
+================================================================================
+
+Shielding time segments:
+Segment 1: 2.597066s ~ 7.139066s (duration: 4.542000s)
+Total verified shielding time: 4.54200000s
+
+Total computation time: 701.67 seconds
+FINAL ANSWER: Maximum shielding time = 4.54250000 seconds
