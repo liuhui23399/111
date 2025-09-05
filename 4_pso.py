@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 from matplotlib import rcParams
 import time
 import copy
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import warnings
+warnings.filterwarnings('ignore')
 
 # 设置中文字体
 rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
@@ -152,9 +156,42 @@ def is_target_shielded_multi_smoke(missile_pos, smoke_centers, smoke_r, target_s
     
     return True
 
-def calc_total_shield_time_multi_uav(params, uav_names, target_samples):
-    """计算多架无人机的总遮蔽时间"""
+def calc_shield_time_at_timestep(args):
+    """计算单个时间步的遮蔽状态（用于并行计算）"""
+    t, missile_dir, missile_m1, uav_data, smoke_param, target_samples = args
+    
+    # 计算导弹位置
+    missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
+    
+    # 计算所有有效烟幕的位置
+    active_smoke_centers = []
+    for uav_name, data in uav_data.items():
+        det_time = data["det_time"]
+        det_point = data["det_point"]
+        
+        # 检查烟幕是否已起爆且仍有效
+        if t >= det_time and t <= det_time + smoke_param["valid_time"]:
+            sink_time = t - det_time
+            smoke_center = np.array([
+                det_point[0],
+                det_point[1],
+                det_point[2] - smoke_param["sink_speed"] * sink_time
+            ])
+            active_smoke_centers.append(smoke_center)
+    
+    # 判断是否被遮蔽
+    if active_smoke_centers:
+        if is_target_shielded_multi_smoke(missile_pos, active_smoke_centers, smoke_param["r"], target_samples):
+            return 1.0  # 被遮蔽
+    
+    return 0.0  # 未被遮蔽
+
+def calc_total_shield_time_multi_uav_parallel(params, uav_names, target_samples, n_jobs=None):
+    """计算多架无人机的总遮蔽时间（并行版本）"""
     try:
+        if n_jobs is None:
+            n_jobs = min(cpu_count(), 8)  # 限制最大进程数避免过载
+            
         num_uavs = len(uav_names)
         
         # 解析参数
@@ -208,38 +245,24 @@ def calc_total_shield_time_multi_uav(params, uav_names, target_samples):
         t_end = max_det_time + smoke_param["valid_time"]
         t_list = np.arange(t_start, t_end + dt, dt)
         
-        # 逐时刻计算遮蔽状态
-        valid_total = 0.0
+        # 准备并行计算的参数
+        args_list = [(t, missile_dir, missile_m1, uav_data, smoke_param, target_samples) for t in t_list]
         
-        for t in t_list:
-            # 计算导弹位置
-            missile_pos = missile_m1["init_pos"] + missile_dir * missile_m1["speed"] * t
-            
-            # 计算所有有效烟幕的位置
-            active_smoke_centers = []
-            for uav_name, data in uav_data.items():
-                det_time = data["det_time"]
-                det_point = data["det_point"]
-                
-                # 检查烟幕是否已起爆且仍有效
-                if t >= det_time and t <= det_time + smoke_param["valid_time"]:
-                    sink_time = t - det_time
-                    smoke_center = np.array([
-                        det_point[0],
-                        det_point[1],
-                        det_point[2] - smoke_param["sink_speed"] * sink_time
-                    ])
-                    active_smoke_centers.append(smoke_center)
-            
-            # 判断是否被遮蔽（使用组合遮蔽逻辑）
-            if active_smoke_centers:
-                if is_target_shielded_multi_smoke(missile_pos, active_smoke_centers, smoke_param["r"], target_samples):
-                    valid_total += dt
+        # 并行计算每个时间步的遮蔽状态
+        if len(args_list) > 100 and n_jobs > 1:  # 只在计算量足够大时使用并行
+            with Pool(n_jobs) as pool:
+                shield_results = pool.map(calc_shield_time_at_timestep, args_list)
+        else:
+            # 小数据量时使用串行计算避免进程开销
+            shield_results = [calc_shield_time_at_timestep(args) for args in args_list]
+        
+        # 计算总遮蔽时间
+        valid_total = sum(shield_results) * dt
         
         return valid_total
         
     except Exception as e:
-        print(f"计算错误: {e}")
+        print(f"并行计算错误: {e}")
         return 0.0
 
 # -------------------------- 3. PSO粒子群优化算法 --------------------------
@@ -300,13 +323,20 @@ class Particle:
             self.best_fitness = self.fitness
             self.best_position = self.position.copy()
 
+def evaluate_particle_fitness(args):
+    """评估单个粒子的适应度（用于并行计算）"""
+    params, uav_names, target_samples = args
+    shield_time = calc_total_shield_time_multi_uav_parallel(params, uav_names, target_samples, n_jobs=1)
+    return -shield_time  # 转换为最小化问题
+
 class PSO:
-    """粒子群优化算法类"""
-    def __init__(self, num_particles=50, max_iterations=200, bounds=None):
+    """粒子群优化算法类（支持并行计算）"""
+    def __init__(self, num_particles=50, max_iterations=200, bounds=None, n_jobs=None):
         self.num_particles = num_particles
         self.max_iterations = max_iterations
         self.bounds = bounds
         self.dim = len(bounds)
+        self.n_jobs = n_jobs if n_jobs is not None else min(cpu_count(), 8)
         
         # 初始化粒子群
         self.particles = [Particle(self.dim, bounds) for _ in range(num_particles)]
@@ -326,22 +356,43 @@ class PSO:
         diversity = np.mean([np.linalg.norm(pos - center) for pos in positions])
         return diversity
     
-    def optimize(self, fitness_func):
-        """执行PSO优化"""
-        print(f"开始PSO优化...")
+    def evaluate_particles_parallel(self, uav_names, target_samples):
+        """并行评估所有粒子的适应度"""
+        # 准备并行计算的参数
+        args_list = [(p.position, uav_names, target_samples) for p in self.particles]
+        
+        # 并行计算适应度
+        if self.n_jobs > 1 and len(self.particles) > 4:
+            with Pool(self.n_jobs) as pool:
+                fitness_values = pool.map(evaluate_particle_fitness, args_list)
+        else:
+            fitness_values = [evaluate_particle_fitness(args) for args in args_list]
+        
+        # 更新粒子适应度
+        for i, fitness in enumerate(fitness_values):
+            self.particles[i].fitness = fitness
+            if fitness < self.particles[i].best_fitness:
+                self.particles[i].best_fitness = fitness
+                self.particles[i].best_position = self.particles[i].position.copy()
+            
+            # 更新全局最优
+            if fitness < self.global_best_fitness:
+                self.global_best_fitness = fitness
+                self.global_best_position = self.particles[i].position.copy()
+    
+    def optimize(self, uav_names, target_samples):
+        """执行PSO优化（并行版本）"""
+        print(f"开始并行PSO优化...")
         print(f"粒子数量: {self.num_particles}")
         print(f"最大迭代次数: {self.max_iterations}")
         print(f"参数维度: {self.dim}")
+        print(f"并行进程数: {self.n_jobs}")
+        print(f"CPU核心数: {cpu_count()}")
         
         start_time = time.time()
         
-        # 初始化评估
-        for particle in self.particles:
-            particle.evaluate(fitness_func)
-            
-            if particle.fitness < self.global_best_fitness:
-                self.global_best_fitness = particle.fitness
-                self.global_best_position = particle.position.copy()
+        # 初始化评估（并行）
+        self.evaluate_particles_parallel(uav_names, target_samples)
         
         print(f"初始最优适应度: {self.global_best_fitness:.6f}")
         
@@ -354,16 +405,13 @@ class PSO:
             c1 = 2.0 - 1.5 * iteration / self.max_iterations
             c2 = 0.5 + 1.5 * iteration / self.max_iterations
             
-            # 更新所有粒子
+            # 更新所有粒子的位置和速度
             for particle in self.particles:
                 particle.update_velocity(self.global_best_position, w, c1, c2)
                 particle.update_position()
-                particle.evaluate(fitness_func)
-                
-                # 更新全局最优
-                if particle.fitness < self.global_best_fitness:
-                    self.global_best_fitness = particle.fitness
-                    self.global_best_position = particle.position.copy()
+            
+            # 并行评估所有粒子
+            self.evaluate_particles_parallel(uav_names, target_samples)
             
             # 记录历史
             self.fitness_history.append(self.global_best_fitness)
@@ -384,16 +432,20 @@ class PSO:
                     break
         
         optimization_time = time.time() - start_time
-        print(f"\nPSO优化完成!")
+        print(f"\n并行PSO优化完成!")
         print(f"最优适应度: {self.global_best_fitness:.6f}")
         print(f"总优化时间: {optimization_time:.2f}秒")
         print(f"实际迭代次数: {len(self.fitness_history)}")
+        print(f"加速效果: 使用 {self.n_jobs} 个进程")
         
         return self.global_best_position, self.global_best_fitness
 
-def pso_optimize_multi_uav(uav_names, target_samples):
-    """使用PSO优化多架无人机参数"""
+def pso_optimize_multi_uav(uav_names, target_samples, n_jobs=None):
+    """使用并行PSO优化多架无人机参数"""
     num_uavs = len(uav_names)
+    
+    if n_jobs is None:
+        n_jobs = min(cpu_count(), 6)  # 默认使用合理的进程数
     
     # 参数边界：[speed, drop_delay, det_delay, angle] * num_uavs
     bounds = []
@@ -407,18 +459,19 @@ def pso_optimize_multi_uav(uav_names, target_samples):
     
     def fitness_func(params):
         """适应度函数（最小化问题）"""
-        shield_time = calc_total_shield_time_multi_uav(params, uav_names, target_samples)
+        shield_time = calc_total_shield_time_multi_uav_parallel(params, uav_names, target_samples, n_jobs=1)
         return -shield_time  # 转换为最小化问题
     
-    # 创建PSO优化器
+    # 创建并行PSO优化器
     pso = PSO(
-        num_particles=60,    # 增加粒子数量
+        num_particles=80,    # 增加粒子数量以适应并行计算
         max_iterations=300,  # 增加迭代次数
-        bounds=bounds
+        bounds=bounds,
+        n_jobs=n_jobs
     )
     
-    # 执行优化
-    best_position, best_fitness = pso.optimize(fitness_func)
+    # 执行并行优化
+    best_position, best_fitness = pso.optimize(uav_names, target_samples)
     
     # 创建结果对象（模拟scipy.optimize的返回格式）
     class PSO_Result:
@@ -440,7 +493,7 @@ def pso_optimize_multi_uav(uav_names, target_samples):
     plt.plot([-f for f in pso.fitness_history], 'b-', linewidth=2)
     plt.xlabel('迭代次数')
     plt.ylabel('遮蔽时间 (秒)')
-    plt.title('PSO收敛曲线')
+    plt.title('并行PSO收敛曲线')
     plt.grid(True, alpha=0.3)
     
     plt.subplot(1, 2, 2)
@@ -451,7 +504,7 @@ def pso_optimize_multi_uav(uav_names, target_samples):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('pso_convergence.png', dpi=300, bbox_inches='tight')
+    plt.savefig('parallel_pso_convergence.png', dpi=300, bbox_inches='tight')
     plt.show()
     
     return result
@@ -512,10 +565,11 @@ if __name__ == "__main__":
             )
             
             # 计算单架无人机的贡献时间
-            single_shield_time = calc_total_shield_time_multi_uav(
+            single_shield_time = calc_total_shield_time_multi_uav_parallel(
                 [speed, drop_delay, det_delay, angle], 
                 [uav_name], 
-                target_samples
+                target_samples,
+                n_jobs=1  # 单机计算使用1个进程
             )
             
             results_data.append({
@@ -541,19 +595,9 @@ if __name__ == "__main__":
             print(f"  单独贡献时间：{single_shield_time:.4f} s")
         
         # 保存到Excel文件
-        try:
-            df = pd.DataFrame(results_data)
-            output_file = "result2_pso.xlsx"
-            df.to_excel(output_file, index=False)
-            print(f"\n结果已保存到 {output_file}")
-        except Exception as e:
-            print(f"\n保存Excel失败: {e}")
-            try:
-                df.to_csv("result2_pso.csv", index=False)
-                print("已保存为CSV格式: result2_pso.csv")
-            except Exception as e2:
-                print(f"CSV保存也失败: {e2}")
-        
+        df = pd.DataFrame(results_data)
+        df.to_csv("result2_pso.csv", index=False)
+        print("已保存为CSV格式: result2_pso.csv")
         print(f"\n*** PSO协同总遮蔽时间：{-result.fun:.6f} 秒 ***")
         
         # 分析协同效果
